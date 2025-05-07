@@ -15,11 +15,13 @@ import torchvision
 import sys
 
 from botocore import UNSIGNED
+from triggering import create_job_file, submit_job
 from torchvision.io import decode_image
 from torchvision import transforms
 from torch.nn import Identity
 from torch.nn.modules.conv import Conv2d
 from torchvision.models.segmentation.deeplabv3 import DeepLabV3, DeepLabHead, ASPP, ASPPConv, ASPPPooling
+from torchvision.models.segmentation.fcn import FCN
 from torch.nn.modules.batchnorm import BatchNorm2d
 from torch.nn.modules.activation import ReLU
 from torch.nn.modules.dropout import Dropout
@@ -31,6 +33,13 @@ from botocore.config import Config
 from datetime import datetime, timedelta
 from scipy.ndimage import center_of_mass, label
 
+class Identity(torch.nn.Module):
+    def __init__(self):
+        super(Identity, self).__init__()
+
+    def forward(self, x):
+        return x
+
 lat_range = [41.1280, 42.5680]
 lon_range = [-88.7176, -87.2873]
 if len(sys.argv) > 1:
@@ -38,9 +47,31 @@ if len(sys.argv) > 1:
 else:
     inp_time = None
 
-out_path = '/nfs/gce/projects/crocus/lake_breeze_ids'
-
+out_path = '/nfs/pub_html/gce/homes/rjackson/lakebreeze_plots'
+nodes = {"W021": True, "V032": True}
+ip = "camera-mobotix-thermal"
+username = "admin"
+password = "meinsm"
+south = "15"
 mobotix_loc = [41.70101404798476, -87.99577278662817]
+
+def mobotix_dir(angle):
+        if angle >= 337.5 or angle < 22.5:
+            return "N"
+        elif angle >= 22.5 and angle < 67.5:
+            return "NE"
+        elif angle >= 67.5 and angle < 112.5:
+            return "E"
+        elif angle >= 112.5 and angle < 157.5:
+            return "SE"
+        elif angle >= 157.5 and angle < 202.5:
+            return "S"
+        elif angle >= 202.5 and angle < 247.5:
+            return "SW"
+        elif angle >= 247.5 and angle < 292.5:
+            return "W"
+        elif angle >= 292.5 and angle < 337.5:
+            return "NW"
 
 if __name__ == "__main__":
     if inp_time is None:
@@ -89,7 +120,7 @@ if __name__ == "__main__":
     
     disp.plot_ppi_map('reflectivity', sweep=1, min_lon=lon_range[0],
             ax=ax, max_lon=lon_range[1], min_lat=lat_range[0], max_lat=lat_range[1],
-            embellish=False, vmin=-30, vmax=60, cmap='Spectral_r',
+            embellish=False, vmin=-20, vmax=60, cmap='Spectral_r',
             add_grid_lines=False, colorbar_flag=False, title_flag=False)
     ax.set_axis_off()
     fig.tight_layout(pad=0, w_pad=0, h_pad=0)
@@ -110,8 +141,8 @@ if __name__ == "__main__":
     
     mask = model(image)['out'].detach().numpy()
     mask = mask[0].argmax(axis=0)
-    mask = mask
-
+    mask = mask.T
+    print(mask.max())
     # Filter out small regions that are not lake breezes
     labels, num_features = label(mask)
     area_threshold = 20
@@ -120,38 +151,36 @@ if __name__ == "__main__":
     largest_index = 0
     for i in range(num_features):
         area = mask[labels == i+1].sum()
+        print(area)
         if area > largest_area:
-            area = largest_area
+            largest_area = area
             largest_index = i+1
         if area < area_threshold:
             mask[labels == i+1] = 0
-    mask = mask.T
-    mask = mask[:, ::-1]
     
     # Decide where to point the instrument
-    lats = np.linspace(lat_range[0], lat_range[1], mask.shape[1])
+    lats = np.linspace(lat_range[1], lat_range[0], mask.shape[1])
     lons = np.linspace(lon_range[0], lon_range[1], mask.shape[0])
-    lat_index = np.argmin(np.abs(lats - mobotix_loc[1]))
-    lon_index = np.argmin(np.abs(lons - mobotix_loc[0]))
+    lat_index = np.argmin(np.abs(lats - mobotix_loc[0]))
+    lon_index = np.argmin(np.abs(lons - mobotix_loc[1]))
 
     # Point to the center of the largest lake breeze region
     mask_largest = np.where(mask == largest_index, mask, 0)
-    center = center_of_mass(mask_largest)
-    angle = np.atan2(-(center[1] - lat_index), (center[0] - lon_index))
+    center = center_of_mass(mask_largest.T)
+    angle = np.atan2(-(mask.shape[1] - center[1] - lat_index), (center[0] - lon_index))
     if angle < 0:
         angle = angle + 2 * np.pi
     deg_angle = np.rad2deg(angle)
-    
-    # Decide where to point the instrument
-    lats = np.linspace(lat_range[0], lat_range[1], mask.shape[1])
-    lons = np.linspace(lon_range[0], lon_range[1], mask.shape[0])
-    lat_index = np.argmin(np.abs(lats - mobotix_loc[1]))
-    lon_index = np.argmin(np.abs(lons - mobotix_loc[0]))
-    
+    deg_dir = mobotix_dir(deg_angle)
     if np.isnan(deg_angle):
-        print("We are not triggering the mobotix")
+        print("We will trigger all directions")
+        directions = ["NEH", "NEB", "NEG", "EH", "EB", "EG", "SEH", "SEB", "SEG", "SH", "SB", "SG", "SWH", "SWB", "SWG"]
     else:
-        print(f"We will point the mobotix at {deg_angle:.2f} degrees")
+        print(f"We will point the mobotix at {deg_dir} degrees")
+        directions = [deg_dir, f"{deg_dir}B", f"{deg_dir}G"]
+
+    job_file = create_job_file(directions, nodes, ip, username, password, south)
+    submit_job("dynamic_scan_job.yaml")
     
 
     lons, lats = np.meshgrid(lons, lats, indexing='xy')
@@ -170,7 +199,7 @@ if __name__ == "__main__":
             
     ax.coastlines()
     ax.add_feature(cfeature.STATES)
-    ax.contour(lons, lats, mask, levels=1)
+    ax.contour(lons, lats, mask.T, levels=1)
     if not np.isnan(center[1]):
         ax.text(lons[lat_index, lon_index], lats[lat_index, lon_index], 'T')
     ax.text(mobotix_loc[1], mobotix_loc[0], 'X')
@@ -181,43 +210,7 @@ if __name__ == "__main__":
     fig.savefig(os.path.join(out_path_bobby_unet, f'KLOT_lake_breeze{date_str}.png'))
     plt.close(fig)
 
-    # Load Seongha's models
-    model_deeplabv3_resnet101 = torchvision.models.segmentation.deeplabv3_resnet101(
-        weights='DeepLabV3_ResNet101_Weights.COCO_WITH_VOC_LABELS_V1')
-    model_deeplabv3_resnet50 = torchvision.models.segmentation.deeplabv3_resnet50(
-        weights='DeepLabV3_ResNet50_Weights.COCO_WITH_VOC_LABELS_V1')
-    model_fcn_resnet101 = torchvision.models.segmentation.fcn_resnet101(
-        weights='FCN_ResNet101_Weights.COCO_WITH_VOC_LABELS_V1')
-    model_fcn_resnet50 = torchvision.models.segmentation.fcn_resnet50(
-        weights='FCN_ResNet50_Weights.COCO_WITH_VOC_LABELS_V1') 
 
-    in_channels = 2048
-    inter_channels = 512
-    channels = 2
-    fcn_new_last_layer = torch.nn.Sequential(
-        torch.nn.Conv2d(in_channels, inter_channels, 3, padding=1, bias=False),
-        torch.nn.BatchNorm2d(inter_channels),
-        torch.nn.ReLU(),
-        torch.nn.Dropout(0.1),
-        torch.nn.Conv2d(inter_channels, channels, 1),
-    )
-    model_fcn_resnet101.classifier = fcn_new_last_layer
-    model_fcn_resnet101.aux_classifier = Identity()
-    model_fcn_resnet50.classifier = fcn_new_last_layer
-    model_fcn_resnet50.aux_classifier = Identity()
-
-    d_in_channels = 1024
-    d_inter_channels = 256
-    deeplab_new_last_layer = torch.nn.Sequential(
-        torch.nn.Conv2d(d_in_channels, d_inter_channels, 3, padding=1, bias=False),
-        torch.nn.BatchNorm2d(d_inter_channels),
-        torch.nn.ReLU(),
-        torch.nn.Dropout(0.1),
-        torch.nn.Conv2d(d_inter_channels, channels, 1),
-    )
-
-    model_deeplabv3_resnet101.aux_classifier = deeplab_new_last_layer
-    model_deeplabv3_resnet50.aux_classifier = deeplab_new_last_layer
 
     model_unet = torch.hub.load('mateuszbuda/brain-segmentation-pytorch', 'unet',
                     in_channels=3, out_channels=1,
@@ -232,7 +225,7 @@ if __name__ == "__main__":
 
     # Load our model state dictionary
     with torch.serialization.safe_globals(
-        [DeepLabV3, BatchNorm2d, Conv2d, IntermediateLayerGetter,
+        [DeepLabV3, BatchNorm2d, Conv2d, IntermediateLayerGetter, FCN, Identity,
          ReLU, MaxPool2d, Sequential, Bottleneck, DeepLabHead, ASPP,
          ModuleList, ASPPConv, ASPPPooling, AdaptiveAvgPool2d, Dropout]) as globby:
         model_fcn_resnet50= torch.load('../models/lakebreeze_best_model_fcn_resnet50.pth',
@@ -243,6 +236,7 @@ if __name__ == "__main__":
             map_location=torch.device('cpu'), weights_only=True)
         model_deeplabv3_resnet50 = torch.load('../models/lakebreeze_best_model_deeplabv3_resnet50.pth',
             map_location=torch.device('cpu'), weights_only=True)
+    print(model_fcn_resnet50)
 
     # Plot UNet model prediction and Mobotix pointing direction
     mask = model_unet(image).detach().numpy()
@@ -258,7 +252,7 @@ if __name__ == "__main__":
     for i in range(num_features):
         area = mask[labels == i+1].sum()
         if area > largest_area:
-            area = largest_area
+            largest_area = area
             largest_index = i+1
         if area < area_threshold:
             mask[labels == i+1] = 0
@@ -272,17 +266,16 @@ if __name__ == "__main__":
     if angle < 0:
         angle = angle + 2 * np.pi
     deg_angle = np.rad2deg(angle)
-
      # Decide where to point the instrument
     lats = np.linspace(lat_range[0], lat_range[1], mask.shape[1])
     lons = np.linspace(lon_range[0], lon_range[1], mask.shape[0])
-    lat_index = np.argmin(np.abs(lats - mobotix_loc[1]))
-    lon_index = np.argmin(np.abs(lons - mobotix_loc[0]))
+    lat_index = np.argmin(np.abs(lats - mobotix_loc[0]))
+    lon_index = np.argmin(np.abs(lons - mobotix_loc[1]))
     
     if np.isnan(deg_angle):
         print("We are not triggering the mobotix")
     else:
-        print(f"We will point the mobotix at {deg_angle:.2f} degrees")
+        print(f"We will point the mobotix {deg_dir}.")
     
     lons, lats = np.meshgrid(lons, lats, indexing='xy')
     if not np.isnan(center[1]):
@@ -325,7 +318,7 @@ if __name__ == "__main__":
     for i in range(num_features):
         area = mask[labels == i+1].sum()
         if area > largest_area:
-            area = largest_area
+            largest_area = area
             largest_index = i+1
         if area < area_threshold:
             mask[labels == i+1] = 0
@@ -341,10 +334,10 @@ if __name__ == "__main__":
     deg_angle = np.rad2deg(angle)
 
      # Decide where to point the instrument
-    lats = np.linspace(lat_range[0], lat_range[1], mask.shape[1])
+    lats = np.linspace(lat_range[1], lat_range[0], mask.shape[1])
     lons = np.linspace(lon_range[0], lon_range[1], mask.shape[0])
-    lat_index = np.argmin(np.abs(lats - mobotix_loc[1]))
-    lon_index = np.argmin(np.abs(lons - mobotix_loc[0]))
+    lat_index = np.argmin(np.abs(lats - mobotix_loc[0]))
+    lon_index = np.argmin(np.abs(lons - mobotix_loc[1]))
     
     if np.isnan(deg_angle):
         print("We are not triggering the mobotix")
@@ -392,7 +385,7 @@ if __name__ == "__main__":
     for i in range(num_features):
         area = mask[labels == i+1].sum()
         if area > largest_area:
-            area = largest_area
+            largest_area = area
             largest_index = i+1
         if area < area_threshold:
             mask[labels == i+1] = 0
@@ -408,10 +401,10 @@ if __name__ == "__main__":
     deg_angle = np.rad2deg(angle)
 
      # Decide where to point the instrument
-    lats = np.linspace(lat_range[0], lat_range[1], mask.shape[1])
+    lats = np.linspace(lat_range[1], lat_range[0], mask.shape[1])
     lons = np.linspace(lon_range[0], lon_range[1], mask.shape[0])
-    lat_index = np.argmin(np.abs(lats - mobotix_loc[1]))
-    lon_index = np.argmin(np.abs(lons - mobotix_loc[0]))
+    lat_index = np.argmin(np.abs(lats - mobotix_loc[0]))
+    lon_index = np.argmin(np.abs(lons - mobotix_loc[1]))
     
     if np.isnan(deg_angle):
         print("We are not triggering the mobotix")
@@ -459,7 +452,7 @@ if __name__ == "__main__":
     for i in range(num_features):
         area = mask[labels == i+1].sum()
         if area > largest_area:
-            area = largest_area
+            largest_area = area
             largest_index = i+1
         if area < area_threshold:
             mask[labels == i+1] = 0
@@ -475,10 +468,10 @@ if __name__ == "__main__":
     deg_angle = np.rad2deg(angle)
 
      # Decide where to point the instrument
-    lats = np.linspace(lat_range[0], lat_range[1], mask.shape[1])
+    lats = np.linspace(lat_range[1], lat_range[0], mask.shape[1])
     lons = np.linspace(lon_range[0], lon_range[1], mask.shape[0])
-    lat_index = np.argmin(np.abs(lats - mobotix_loc[1]))
-    lon_index = np.argmin(np.abs(lons - mobotix_loc[0]))
+    lat_index = np.argmin(np.abs(lats - mobotix_loc[0]))
+    lon_index = np.argmin(np.abs(lons - mobotix_loc[1]))
     
     if np.isnan(deg_angle):
         print("We are not triggering the mobotix")
@@ -526,12 +519,12 @@ if __name__ == "__main__":
     for i in range(num_features):
         area = mask[labels == i+1].sum()
         if area > largest_area:
-            area = largest_area
+            largest_area = area
             largest_index = i+1
         if area < area_threshold:
             mask[labels == i+1] = 0
     mask = mask.T
-    mask = mask[:, ::-1]
+    
 
     # Point to the center of the largest lake breeze region
     mask_largest = np.where(mask == largest_index, mask, 0)
@@ -542,10 +535,10 @@ if __name__ == "__main__":
     deg_angle = np.rad2deg(angle)
 
      # Decide where to point the instrument
-    lats = np.linspace(lat_range[0], lat_range[1], mask.shape[1])
+    lats = np.linspace(lat_range[1], lat_range[0], mask.shape[1])
     lons = np.linspace(lon_range[0], lon_range[1], mask.shape[0])
-    lat_index = np.argmin(np.abs(lats - mobotix_loc[1]))
-    lon_index = np.argmin(np.abs(lons - mobotix_loc[0]))
+    lat_index = np.argmin(np.abs(lats - mobotix_loc[0]))
+    lon_index = np.argmin(np.abs(lons - mobotix_loc[1]))
     
     if np.isnan(deg_angle):
         print("We are not triggering the mobotix")
